@@ -24,7 +24,6 @@ import java.util.concurrent.TimeoutException;
 /**
  * Test class for WebSocket functionality in the Solana Java client.
  */
-@Disabled
 public class WebsocketTest {
 
     private static final Logger LOGGER = Logger.getLogger(WebsocketTest.class.getName());

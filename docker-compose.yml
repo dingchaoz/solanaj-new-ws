@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  solana:
+    image: solana-test-validator
+    container_name: solana-validator
+    ports:
+      # RPC HTTP
+      - "8899:8899"
+      # RPC WebSocket
+      - "8900:8900"
+      # Other required ports
+      - "8001-8009:8001-8009"
+      - "9900:9900"
+    command: solana-test-validator
+    healthcheck:
+      test: ["CMD", "solana", "cluster-version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3 

@@ -12,56 +12,58 @@ import java.util.logging.Logger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.Lock;
 import org.p2p.solanaj.rpc.types.config.Commitment;
+import org.p2p.solanaj.rpc.types.RpcRequest;
 
 import com.squareup.moshi.JsonAdapter;
 import com.squareup.moshi.Moshi;
 import com.squareup.moshi.Types;
 
-import org.java_websocket.client.WebSocketClient;
-import org.java_websocket.framing.CloseFrame;
-import org.java_websocket.handshake.ServerHandshake;
-import org.p2p.solanaj.rpc.types.RpcNotificationResult;
-import org.p2p.solanaj.rpc.types.RpcRequest;
-import org.p2p.solanaj.rpc.types.RpcResponse;
+import org.springframework.web.reactive.socket.WebSocketMessage;
+import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient;
+import org.springframework.web.reactive.socket.WebSocketSession;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Schedulers;
 import org.p2p.solanaj.ws.listeners.NotificationEventListener;
+import org.p2p.solanaj.rpc.types.RpcNotificationResult;
+import org.p2p.solanaj.rpc.types.RpcResponse;
 
 /**
- * SubscriptionWebSocketClient is a WebSocket client for managing subscriptions to various Solana events.
- * 
- * This class allows users to subscribe to different types of notifications from the Solana blockchain, 
- * such as account updates, block updates, program updates, and vote updates. Each subscription is 
- * identified by a unique subscription ID, which is generated when a subscription request is made. 
- * The client maintains a mapping of these subscription IDs to their corresponding parameters and 
- * notification listeners, enabling efficient management of active subscriptions.
- * 
- * Users can specify various parameters for their subscriptions, including the commitment level 
- * (e.g., FINALIZED, CONFIRMED) and the encoding format (e.g., jsonParsed, base64) for the data 
- * received in notifications. The client handles incoming WebSocket messages, processes notifications, 
- * and invokes the appropriate listener callbacks with the received data.
- * 
- * The class also provides methods for unsubscribing from notifications, ensuring that resources 
- * are properly released when subscriptions are no longer needed. Thread safety is maintained 
- * through the use of locks to protect shared data structures during subscription management.
+ * SubscriptionWebSocketClient using Spring WebSocket with Reactive Stack (Project Reactor)
+ * This implementation provides better scalability and non-blocking operations compared to
+ * the traditional WebSocket implementation.
  */
-public class SubscriptionWebSocketClient extends WebSocketClient {
+public class SubscriptionWebSocketClient {
 
     private static final Logger LOGGER = Logger.getLogger(SubscriptionWebSocketClient.class.getName());
-    private static final int MAX_RECONNECT_DELAY = 30000;
-    private static final int INITIAL_RECONNECT_DELAY = 1000;
-    private static final int HEARTBEAT_INTERVAL = 30;
-
+    
+    // Spring WebSocket client using Reactor Netty
+    private final ReactorNettyWebSocketClient webSocketClient;
+    
+    // Reactive components for handling messages
+    private final Sinks.Many<String> messageSink;
+    private final Flux<String> messageFlux;
+    private WebSocketSession session;
+    
+    // Keep existing fields for subscription management
     private final Map<String, SubscriptionParams> subscriptions = new ConcurrentHashMap<>();
     private final Map<String, Long> subscriptionIds = new ConcurrentHashMap<>();
     private final Map<Long, NotificationEventListener> subscriptionListeners = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-    private final CountDownLatch connectLatch = new CountDownLatch(1);
+    
+    // Reactive scheduler for handling background tasks
+    private final reactor.core.scheduler.Scheduler scheduler = Schedulers.boundedElastic();
 
-    private int reconnectDelay = INITIAL_RECONNECT_DELAY;
+    // Add these field declarations at the class level
     private final Moshi moshi = new Moshi.Builder().build();
-
-    private final Map<String, SubscriptionParams> activeSubscriptions = new ConcurrentHashMap<>();
     private final Lock subscriptionLock = new ReentrantLock();
+    private final Map<String, SubscriptionParams> activeSubscriptions = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+    private static final int HEARTBEAT_INTERVAL = 30; // seconds
     private final Lock listenerLock = new ReentrantLock();
+    private long reconnectDelay = 1000; // Initial delay in milliseconds
+    private static final long MAX_RECONNECT_DELAY = 60000; // Maximum delay in milliseconds
+    private final CountDownLatch connectLatch = new CountDownLatch(1);
 
     /**
      * Inner class to hold subscription parameters.
@@ -93,7 +95,7 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
             URI serverURI = new URI(endpoint);
             SubscriptionWebSocketClient instance = new SubscriptionWebSocketClient(serverURI);
             if (!instance.isOpen()) {
-                instance.connect();
+                instance.connect(serverURI);
             }
             return instance;
         } catch (URISyntaxException e) {
@@ -113,7 +115,7 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
             String scheme = "https".equals(endpointURI.getScheme()) ? "wss" : "ws";
             URI serverURI = new URI(scheme + "://" + endpointURI.getHost());
             SubscriptionWebSocketClient instance = new SubscriptionWebSocketClient(serverURI);
-            instance.connect();
+            instance.connect(serverURI);
             return instance;
         } catch (URISyntaxException e) {
             throw new IllegalArgumentException("Invalid endpoint URI", e);
@@ -126,7 +128,92 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
      * @param serverURI The URI of the WebSocket server
      */
     public SubscriptionWebSocketClient(URI serverURI) {
-        super(serverURI);
+        // Initialize Spring WebSocket client
+        this.webSocketClient = new ReactorNettyWebSocketClient();
+        
+        // Create a many-to-many broadcast sink for message handling
+        this.messageSink = Sinks.many().multicast().onBackpressureBuffer();
+        this.messageFlux = messageSink.asFlux()
+                .publishOn(scheduler)
+                .share();
+        
+        // Connect to WebSocket server
+        connect(serverURI);
+    }
+
+    /**
+     * Establishes WebSocket connection using Spring's Reactive WebSocket client
+     */
+    private void connect(URI serverURI) {
+        webSocketClient.execute(serverURI, this::handleWebSocketSession)
+                .doOnSuccess(unused -> connectLatch.countDown())
+                .doOnError(error -> {
+                    LOGGER.severe("WebSocket connection error: " + error.getMessage());
+                    connectLatch.countDown();
+                })
+                .subscribe();
+    }
+
+    /**
+     * Handles the WebSocket session using Reactive streams
+     * This is where Spring WebSocket and Project Reactor integrate
+     */
+    private Mono<Void> handleWebSocketSession(WebSocketSession session) {
+        this.session = session;
+        startHeartbeat();
+        
+        // Handle incoming messages
+        Mono<Void> receive = session.receive()
+                .map(WebSocketMessage::getPayloadAsText)
+                .doOnNext(this::handleIncomingMessage)
+                .then();
+
+        // Handle outgoing messages
+        Mono<Void> send = messageFlux
+                .map(session::textMessage)
+                .as(session::send);
+
+        return Mono.zip(receive, send).then();
+    }
+
+    /**
+     * Handles incoming messages using Reactive approach
+     */
+    private void handleIncomingMessage(String message) {
+        try {
+            // Process message using existing logic but in a reactive way
+            Mono.fromCallable(() -> {
+                JsonAdapter<RpcResponse<Long>> resultAdapter = moshi.adapter(
+                        Types.newParameterizedType(RpcResponse.class, Long.class));
+                RpcResponse<Long> rpcResult = resultAdapter.fromJson(message);
+                
+                if (rpcResult != null && rpcResult.getError() != null) {
+                    throw new IllegalStateException(rpcResult.getError().toString());
+                }
+                
+                if (rpcResult != null && rpcResult.getId() != null) {
+                    handleSubscriptionResponse(rpcResult);
+                } else {
+                    handleNotification(message);
+                }
+                return true;
+            })
+            .subscribeOn(scheduler)
+            .subscribe(
+                success -> {},
+                error -> LOGGER.severe("Error processing message: " + error.getMessage())
+            );
+        } catch (Exception ex) {
+            LOGGER.severe("Error processing message: " + ex.getMessage());
+        }
+    }
+
+    /**
+     * Sends a message through the WebSocket connection using Reactive approach
+     */
+    private void sendMessage(String message) {
+        messageSink.tryEmitNext(message)
+                .orThrow(); // Handle emission failure
     }
 
     /**
@@ -143,7 +230,11 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
         params.add(Map.of("encoding", encoding, "commitment", commitment.getValue()));
 
         RpcRequest rpcRequest = new RpcRequest("accountSubscribe", params);
-        addSubscription(rpcRequest, listener);
+        
+        // Add subscription using Reactive approach
+        Mono.fromRunnable(() -> addSubscription(rpcRequest, listener))
+            .subscribeOn(scheduler)
+            .subscribe();
     }
 
     // Overload methods to maintain backwards compatibility
@@ -379,43 +470,6 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
     }
 
     /**
-     * Handles the WebSocket connection opening.
-     *
-     * @param handshakedata The server handshake data
-     */
-    @Override
-    public void onOpen(ServerHandshake handshakedata) {
-        LOGGER.info("WebSocket connection opened");
-        reconnectDelay = INITIAL_RECONNECT_DELAY;
-        startHeartbeat();
-        connectLatch.countDown();
-    }
-
-    /**
-     * Handles incoming WebSocket messages.
-     *
-     * @param message The received message
-     */
-    @Override
-    public void onMessage(String message) {
-        try {
-            JsonAdapter<RpcResponse<Long>> resultAdapter = moshi.adapter(
-                    Types.newParameterizedType(RpcResponse.class, Long.class));
-            RpcResponse<Long> rpcResult = resultAdapter.fromJson(message);
-            if(rpcResult!=null && rpcResult.getError()!=null){
-                throw new IllegalStateException(rpcResult.getError().toString());
-            }
-            if (rpcResult != null && rpcResult.getId() != null) {
-                handleSubscriptionResponse(rpcResult);
-            } else {
-                handleNotification(message);
-            }
-        } catch (Exception ex) {
-            LOGGER.log(Level.SEVERE, "Error processing message", ex);
-        }
-    }
-
-    /**
      * Handles subscription responses.
      *
      * @param rpcResult The RPC response
@@ -486,21 +540,6 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
      * @param reason A human-readable explanation for the closure
      * @param remote Whether the closure was initiated by the remote endpoint
      */
-    @Override
-    public void onClose(int code, String reason, boolean remote) {
-        LOGGER.info("Connection closed by " + (remote ? "remote peer" : "us") + " Code: " + code + " Reason: " + reason);
-        stopHeartbeat();
-        if (remote || code != CloseFrame.NORMAL) {
-            scheduleReconnect();
-        }
-    }
-
-    /**
-     * Handles WebSocket errors.
-     *
-     * @param ex The exception that describes the error
-     */
-    @Override
     public void onError(Exception ex) {
         LOGGER.log(Level.SEVERE, "WebSocket error occurred", ex);
         if (ex instanceof org.java_websocket.exceptions.WebsocketNotConnectedException) {
@@ -535,7 +574,7 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
      * Starts the heartbeat mechanism to keep the connection alive.
      */
     private void startHeartbeat() {
-        executor.scheduleAtFixedRate(this::sendPing, HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL, TimeUnit.SECONDS);
+        executor.scheduleAtFixedRate(this::sendPing, (long)HEARTBEAT_INTERVAL, (long)HEARTBEAT_INTERVAL, TimeUnit.SECONDS);
     }
 
     /**
@@ -592,7 +631,8 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
      * @throws InterruptedException if the current thread is interrupted while waiting
      */
     public boolean waitForConnection(long timeout, TimeUnit unit) throws InterruptedException {
-        return connectLatch.await(timeout, unit);
+        boolean connected = connectLatch.await(timeout, unit);
+        return connected && isOpen();
     }
 
     private void resubscribeAll() {
@@ -617,7 +657,7 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
         updateSubscriptions();
     }
 
-    private void cleanSubscriptions(){
+    public void cleanSubscriptions(){
         subscriptions.clear();
         subscriptionIds.clear();
         subscriptionListeners.clear();
@@ -681,4 +721,36 @@ public class SubscriptionWebSocketClient extends WebSocketClient {
         }
         return null;
     }
+
+    // Add this method to the SubscriptionWebSocketClient class
+    public boolean isOpen() {
+        return session != null && session.isOpen();
+    }
+
+    // Add this method for sending messages
+    public void send(String message) {
+        sendMessage(message);
+    }
+
+    private boolean reconnectBlocking() throws InterruptedException {
+        connect(session.getHandshakeInfo().getUri());
+        return isOpen();
+    }
+
+    private void sendPing() {
+        if (isOpen()) {
+            send("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
+        }
+    }
+
+    public Flux<String> getMessageFlux() {
+        return messageFlux;
+    }
+
+    public void close() {
+        if (session != null) {
+            session.close();
+        }
+    }
+
 }
